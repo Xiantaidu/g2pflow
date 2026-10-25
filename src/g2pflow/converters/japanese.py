@@ -1,5 +1,6 @@
 """Japanese kana and MeCab G2P converters with shared pronunciation rules."""
 
+import unicodedata
 from itertools import product
 from pathlib import Path
 
@@ -75,6 +76,29 @@ _KANA_TO_ROMAJI: dict[str, str] = {
     "を": "o",
 }
 
+# Kana forms absent from the digraph table.
+_KANA_TOKEN_ROMAJI = {
+    "ぁ": "a", "ぃ": "i", "ぅ": "u", "ぇ": "e", "ぉ": "o",
+    "ゃ": "ya", "ゅ": "yu", "ょ": "yo", "ゎ": "wa",
+    "ゕ": "ka", "ゖ": "ke", "ゟ": "yori", "ヿ": "koto",
+}
+_SILENT_KANA = frozenset("ー・゛゜゠")
+_ITERATION_MARKS = frozenset("ゝゞ")
+_COMBINING_MARKS = {"゙": "\u3099", "゚": "\u309a"}
+
+
+def _token_script(token: str) -> str:
+    """Romaji for one kana token, decomposing forms absent from the table."""
+    if token in _SILENT_KANA:
+        return ""
+    romaji = _KANA_TO_ROMAJI.get(token)
+    if romaji is not None:
+        return romaji
+    return "".join(_KANA_TOKEN_ROMAJI.get(char)
+                   or _KANA_TO_ROMAJI.get(char, "")
+                   for char in token if char not in _SILENT_KANA)
+
+
 _HIRAGANA_START = 0x3041
 _KATAKANA_START = 0x30A1
 _KANA_SPAN = 0x5E
@@ -135,7 +159,13 @@ class JapaneseKanaConverter(PronunciationScriptDictionaryConverter):
         return find_run(text, is_kana)
 
     def _tokenize(self, text: str) -> list[str]:
-        words = super()._tokenize(text)
+        words: list[str] = []
+        for token in super()._tokenize(text):
+            # Unknown multi-mora tokens must become single-mora dictionary keys.
+            if len(token) > 1 and _kata_to_hira(token) not in _KANA_TO_ROMAJI:
+                words.extend(token)
+            else:
+                words.append(token)
         if not self._double_written_sokuon:
             return words
         result: list[str] = []
@@ -161,19 +191,36 @@ class JapaneseKanaConverter(PronunciationScriptDictionaryConverter):
         return super().script_to_paths(script)
 
     def text_to_scripts(self, words: list[str]) -> list[list[str]]:
-        # Convert katakana to hiragana for unified lookup
         hiragana_tokens = [_kata_to_hira(t) for t in words]
 
-        # Kana -> romaji; long vowel U+30FC and handakuten U+309C are empty.
-        romaji_list: list[str] = []
-        for t in hiragana_tokens:
-            if t in ("ー", "゜"):
-                romaji_list.append("")
+        scripts: list[str] = []
+        previous = ""
+        previous_script = ""
+        for token in hiragana_tokens:
+            mark = _COMBINING_MARKS.get(token)
+            if mark is not None:
+                if previous:
+                    composed = unicodedata.normalize("NFC", previous[-1] + mark)
+                    if composed != previous[-1]:
+                        previous = previous[:-1] + composed
+                        previous_script = _token_script(previous)
+                        scripts[-1] = previous_script
+                scripts.append("")
                 continue
-            r = _sokuon_script(t) if self._double_written_sokuon else None
-            romaji_list.append(r or _KANA_TO_ROMAJI.get(t, t))
+            if token in _ITERATION_MARKS:
+                script = previous_script
+                if token == "ゞ" and previous:
+                    voiced = unicodedata.normalize("NFC", previous[-1] + "\u3099")
+                    if voiced != previous[-1]:
+                        script = _token_script(previous[:-1] + voiced)
+                scripts.append(script)
+                continue
+            combined = _sokuon_script(token) if self._double_written_sokuon else None
+            previous = token
+            previous_script = combined or _token_script(token)
+            scripts.append(previous_script)
 
-        return [[r] for r in romaji_list]
+        return [[script] for script in scripts]
 
 
 def _is_japanese_char(char: str) -> bool:
